@@ -1,0 +1,181 @@
+from django.conf import settings
+from django.contrib import messages
+from django.core.mail import send_mail
+from django.db.models import Q, Count
+from django.http import HttpResponse
+from django.shortcuts import render, redirect, get_object_or_404
+from django.urls import reverse
+from django.views import View
+from django.views.generic import ListView
+from django.views.generic.detail import DetailView
+from taggit.models import Tag
+
+from tasks.forms import AddTaskForm, TodoItemForm, TodoItemExportForm
+from tasks.models import TodoItem
+
+from django.contrib.auth.decorators import login_required
+from django.contrib.auth.mixins import LoginRequiredMixin
+
+
+# Create your views here.
+def index(request):
+    counts = Tag.objects.annotate(
+        total_tasks=Count('todoitem')
+    ).order_by("-total_tasks")
+
+    counts = {
+        c.name: c.total_tasks
+        for c in counts
+    }
+
+    return render(request, "tasks/index.html", {"counts": counts})
+
+
+def complete_task(request, uid):
+    t = TodoItem.objects.get(id=uid)
+    t.is_completed = True
+    t.save()
+    return HttpResponse("OK")
+
+
+def add_task(request):
+    if request.method == "POST":
+        desc = request.POST["description"]
+        t = TodoItem(description=desc)
+        t.save()
+    return reverse("tasks:list")
+
+
+def delete_task(request, uid):
+    t = TodoItem.objects.get(id=uid)
+    t.delete()
+    messages.success(request, "Task was deleted")
+    return redirect(reverse("tasks:list"))
+
+
+def filter_tags(tags_by_tags):
+    tags = []
+    for lists in tags_by_tags:
+        for i in lists:
+            if i not in tags:
+                tags.append(i)
+    return tags
+
+
+class TaskListView(LoginRequiredMixin, ListView):
+    model = TodoItem
+    context_object_name = "tasks"
+    template_name = "tasks/list.html"
+
+    def get_queryset(self):
+        u = self.request.user
+        return u.tasks.all()
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+
+        user_tasks = self.get_queryset()
+        tags = []
+        for t in user_tasks:
+            tags.append(list(t.tags.all()))
+
+        context['tags'] = filter_tags(tags)
+        return context
+
+
+class TaskCreateView(LoginRequiredMixin, View):
+    def post(self, request, *args, **kwargs):
+        form = TodoItemForm(request.POST)
+        if form.is_valid():
+            new_task = form.save(commit=False)
+            new_task.owner = request.user
+            new_task.save()
+            form.save_m2m()
+            return redirect(reverse("tasks:list"))
+
+        return render(request, "tasks/create.html", {"form": form})
+
+    def get(self, request, *args, **kwargs):
+        form = TodoItemForm()
+        return render(request, "tasks/create.html", {"form": form})
+
+
+class TaskDetailsView(DetailView):
+    model = TodoItem
+    template_name = 'tasks/details.html'
+
+
+class TaskEditView(LoginRequiredMixin, View):
+    def post(self, request, pk, *args, **kwargs):
+        t = TodoItem.objects.get(id=pk)
+        form = TodoItemForm(request.POST, instance=t)
+        if form.is_valid():
+            new_task = form.save(commit=False)
+            new_task.owner = request.user
+            new_task.save()
+            return redirect(reverse("tasks:list"))
+
+        return render(request, "tasks/edit.html", {"form": form})
+
+    def get(self, request, pk, *args, **kwargs):
+        t = TodoItem.objects.get(id=pk)
+        form = TodoItemForm(instance=t)
+        return render(request, "tasks/edit.html", {"form": form, "task": t})
+
+
+class TaskExportView(LoginRequiredMixin, View):
+    def generate_body(self, user, priorities):
+        q = Q()
+        if priorities["prio_high"]:
+            q = q | Q(priority=TodoItem.PRIORITY_HIGH)
+        if priorities["prio_med"]:
+            q = q | Q(priority=TodoItem.PRIORITY_MEDIUM)
+        if priorities["prio_low"]:
+            q = q | Q(priority=TodoItem.PRIORITY_LOW)
+        tasks = TodoItem.objects.filter(owner=user).filter(q).all()
+
+        body = "Your tasks and priorities:\n"
+        for t in list(tasks):
+            if t.is_completed:
+                body += f"[x] {t.description} ({t.get_priority_display()})\n"
+            else:
+                body += f"[ ] {t.description} ({t.get_priority_display()})\n"
+
+        return body
+
+    def post(self, request, *args, **kwargs):
+        form = TodoItemExportForm(request.POST)
+        if form.is_valid():
+            email = request.user.email
+            body = self.generate_body(request.user, form.cleaned_data)
+            send_mail("Tasks", body, settings.EMAIL_HOST_USER, [email])
+            messages.success(
+                request, "Tasks have been sent by the e-mail %s" % email)
+        else:
+            messages.error(request, "Something went wrong, try again")
+        return redirect(reverse("tasks:list"))
+
+    def get(self, request, *args, **kwargs):
+        form = TodoItemExportForm()
+        return render(request, "tasks/export.html", {"form": form})
+
+
+def tasks_by_tag(request, tag_slug=None):
+    u = request.user
+    tasks = TodoItem.objects.filter(owner=u).all()
+
+    tag = None
+    if tag_slug:
+        tag = get_object_or_404(Tag, slug=tag_slug)
+        tasks = tasks.filter(tags__in=[tag])
+
+    all_tags = []
+    for t in tasks:
+        all_tags.append(list(t.tags.all()))
+    all_tags = filter_tags(all_tags)
+
+    return render(
+        request,
+        "tasks/list_by_tag.html",
+        {"tag": tag, "tasks": tasks, "all_tags": all_tags},
+    )
